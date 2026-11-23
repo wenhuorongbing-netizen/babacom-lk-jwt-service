@@ -9,19 +9,22 @@ use livekit_protocol::{ParticipantInfo, ParticipantPermission, TrackInfo, TrackS
 use lk_jwt_service_integration_tests::{
     APP_SERVICE_AS_TOKEN, FakeHomeserver, FakeSfu, FakeUser, Service, ServiceConfig,
     app_service_env, decode_livekit_jwt, expect_is_joined_request, expect_matrix_error,
-    livekit_identity, livekit_room_alias, send_sfu_webhook,
+    legacy_livekit_identity, livekit_room_alias, send_sfu_webhook,
 };
 use serde_json::{Value, json};
 
 const ROOM_ID: &str = "!room:example.com";
 const SLOT_ID: &str = "m.call#ROOM";
 const MEMBER_ID: &str = "member-1";
+const DEVICE_ID: &str = "DEVICE";
 
 fn share_request(hs: &FakeHomeserver, user: &FakeUser) -> Value {
     json!({
         "room_id": ROOM_ID,
         "slot_id": SLOT_ID,
         "member_id": MEMBER_ID,
+        "device_id": DEVICE_ID,
+        "attempt_id": format!("{}-1", user.user_id),
         "openid_token": {
             "access_token": user.openid_token,
             "token_type": "Bearer",
@@ -66,15 +69,21 @@ fn base_permission() -> ParticipantPermission {
 }
 
 /// Request a standalone join JWT, then simulate the participant joining the SFU.
+///
+/// The JWT identity must be the one MatrixRTC clients derive from a membership
+/// (user, device, member); otherwise remote clients cannot match the participant.
 async fn join(svc: &Service, sfu: &FakeSfu, hs: &FakeHomeserver, user: &FakeUser) -> String {
     let room = livekit_room_alias(ROOM_ID, SLOT_ID);
-    let identity = livekit_identity(&user.user_id, MEMBER_ID);
+    let identity = legacy_livekit_identity(&user.user_id, DEVICE_ID, MEMBER_ID);
     let mut request = share_request(hs, user);
-    request.as_object_mut().unwrap().remove("member_id");
+    let fields = request.as_object_mut().unwrap();
+    fields.remove("member_id");
+    fields.remove("device_id");
+    fields.remove("attempt_id");
     request["member"] = json!({
         "id": MEMBER_ID,
         "claimed_user_id": user.user_id,
-        "claimed_device_id": "DEVICE",
+        "claimed_device_id": DEVICE_ID,
     });
     let (status, body) = post(svc, "/get_token", &request).await;
     assert_eq!(status, 200, "{body}");
@@ -224,6 +233,60 @@ async fn claim_requires_verified_room_membership_and_an_sfu_participant() {
 }
 
 #[tokio::test]
+async fn claim_targets_the_device_that_joined() {
+    let hs = FakeHomeserver::new().await;
+    let alice = hs.new_user("alice");
+    let sfu = FakeSfu::new().await;
+    let svc = start(&hs, &sfu, true).await;
+    join(&svc, &sfu, &hs, &alice).await;
+
+    let mut missing_device = share_request(&hs, &alice);
+    missing_device.as_object_mut().unwrap().remove("device_id");
+    let (status, body) = post(&svc, "/babacom/share/claim", &missing_device).await;
+    expect_matrix_error(status, &body, 400, "M_BAD_JSON");
+
+    // Another device of the same user is a different participant.
+    let mut other_device = share_request(&hs, &alice);
+    other_device["device_id"] = json!("OTHER");
+    let (status, body) = post(&svc, "/babacom/share/claim", &other_device).await;
+    expect_matrix_error(status, &body, 409, "IO.BABACOM.NOT_IN_CALL");
+
+    expect_state(
+        post(&svc, "/babacom/share/claim", &share_request(&hs, &alice)).await,
+        "held",
+    );
+}
+
+#[tokio::test]
+async fn claim_accepts_only_this_users_sfu_get_identity() {
+    let hs = FakeHomeserver::new().await;
+    let alice = hs.new_user("alice");
+    let bob = hs.new_user("bob");
+    let sfu = FakeSfu::new().await;
+    let svc = start(&hs, &sfu, true).await;
+    // Joined through the legacy /sfu/get endpoint, which names participants user:device.
+    let legacy_identity = format!("{}:{DEVICE_ID}", alice.user_id);
+    sfu.set_participant_info(
+        &livekit_room_alias(ROOM_ID, SLOT_ID),
+        ParticipantInfo {
+            identity: legacy_identity.clone(),
+            permission: Some(base_permission()),
+            ..Default::default()
+        },
+    );
+
+    let mut not_hers = share_request(&hs, &alice);
+    not_hers["livekit_identity"] = json!(format!("{}:{DEVICE_ID}", bob.user_id));
+    let (status, body) = post(&svc, "/babacom/share/claim", &not_hers).await;
+    expect_matrix_error(status, &body, 403, "M_FORBIDDEN");
+
+    let mut request = share_request(&hs, &alice);
+    request["livekit_identity"] = json!(legacy_identity);
+    expect_state(post(&svc, "/babacom/share/claim", &request).await, "held");
+    expect_state(post(&svc, "/babacom/share/release", &request).await, "free");
+}
+
+#[tokio::test]
 async fn leave_webhook_checks_that_the_holder_is_absent() {
     let hs = FakeHomeserver::new().await;
     let alice = hs.new_user("alice");
@@ -261,6 +324,77 @@ async fn leave_webhook_checks_that_the_holder_is_absent() {
         post(&svc, "/babacom/share/claim", &share_request(&hs, &bob)).await,
         "held",
     );
+}
+
+#[tokio::test]
+async fn a_claim_that_arrives_after_its_release_is_refused() {
+    let hs = FakeHomeserver::new().await;
+    let alice = hs.new_user("alice");
+    let sfu = FakeSfu::new().await;
+    let svc = start(&hs, &sfu, true).await;
+    join(&svc, &sfu, &hs, &alice).await;
+    let request = share_request(&hs, &alice);
+
+    expect_state(post(&svc, "/babacom/share/release", &request).await, "free");
+    let (status, body) = post(&svc, "/babacom/share/claim", &request).await;
+    expect_matrix_error(status, &body, 409, "IO.BABACOM.SHARE_STALE");
+
+    let mut next_attempt = request;
+    next_attempt["attempt_id"] = json!("alice-2");
+    expect_state(
+        post(&svc, "/babacom/share/claim", &next_attempt).await,
+        "held",
+    );
+}
+
+#[tokio::test]
+async fn a_rejoin_with_stale_screen_rights_is_stripped() {
+    let hs = FakeHomeserver::new().await;
+    let alice = hs.new_user("alice");
+    let bob = hs.new_user("bob");
+    let sfu = FakeSfu::new().await;
+    let svc = start(&hs, &sfu, true).await;
+    let room = livekit_room_alias(ROOM_ID, SLOT_ID);
+    let alice_identity = join(&svc, &sfu, &hs, &alice).await;
+    let bob_identity = join(&svc, &sfu, &hs, &bob).await;
+    expect_state(
+        post(&svc, "/babacom/share/claim", &share_request(&hs, &bob)).await,
+        "held",
+    );
+
+    // Alice reconnects with a refreshed token from an earlier share.
+    let screen_sources = vec![
+        TrackSource::Camera as i32,
+        TrackSource::Microphone as i32,
+        TrackSource::ScreenShare as i32,
+        TrackSource::ScreenShareAudio as i32,
+    ];
+    sfu.set_participant_info(
+        &room,
+        ParticipantInfo {
+            identity: alice_identity.clone(),
+            permission: Some(ParticipantPermission {
+                can_publish_sources: screen_sources.clone(),
+                ..base_permission()
+            }),
+            ..Default::default()
+        },
+    );
+    send_sfu_webhook(&svc, "participant_joined", &room, &alice_identity, None).await;
+
+    let sources = |identity: &str| {
+        sfu.participant_info(&room, identity)
+            .and_then(|info| info.permission)
+            .map(|permission| permission.can_publish_sources)
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while sources(&alice_identity) != Some(base_permission().can_publish_sources) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the stale screen rights should be removed");
+    assert_eq!(sources(&bob_identity), Some(screen_sources));
 }
 
 #[tokio::test]

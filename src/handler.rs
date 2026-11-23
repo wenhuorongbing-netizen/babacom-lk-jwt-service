@@ -972,19 +972,6 @@ impl Handler {
         .await
     }
 
-    fn standalone_livekit_identity(
-        &self,
-        matrix_id: &str,
-        device_id: &str,
-        member_id: &str,
-    ) -> LiveKitIdentity {
-        if self.share_arbiter.get().is_some() {
-            livekit_identity_for(matrix_id, member_id)
-        } else {
-            legacy_livekit_identity_for(matrix_id, device_id, member_id)
-        }
-    }
-
     /// Deprecated: serves the pre-Matrix-2.0 /sfu/get endpoint. Remove once
     /// all in-the-wild clients have migrated to /get_token.
     pub(crate) async fn process_legacy_sfu_request(
@@ -1091,11 +1078,8 @@ impl Handler {
         self.enforce_legacy_membership(&matrix_id, &req.room_id)
             .await?;
 
-        let lk_identity = self.standalone_livekit_identity(
-            &matrix_id,
-            &req.member.claimed_device_id,
-            &req.member.id,
-        );
+        let lk_identity =
+            legacy_livekit_identity_for(&matrix_id, &req.member.claimed_device_id, &req.member.id);
         let lk_room_alias = livekit_room_alias_for(&req.room_id, &req.slot_id);
 
         let token = self.get_join_token_or_internal_error(
@@ -1345,11 +1329,8 @@ impl Handler {
         self.enforce_legacy_membership(&matrix_id, &req.room_id)
             .await?;
 
-        let lk_identity = self.standalone_livekit_identity(
-            &matrix_id,
-            &req.member.claimed_device_id,
-            &req.member.id,
-        );
+        let lk_identity =
+            legacy_livekit_identity_for(&matrix_id, &req.member.claimed_device_id, &req.member.id);
         let lk_room_alias = livekit_room_alias_for(&req.room_id, &req.slot_id);
 
         // Verify that the Client-Server API can be resolved and prime the
@@ -1592,8 +1573,19 @@ struct ShareRequest {
     #[serde(default)]
     member_id: String,
     #[serde(default)]
+    device_id: String,
+    /// Client-chosen ID of one share attempt; claim and release must agree.
+    #[serde(default)]
+    attempt_id: String,
+    /// The LiveKit identity the client is connected with, when it is not the
+    /// Matrix 2.0 one, e.g. `user:device` from the legacy /sfu/get endpoint.
+    #[serde(default)]
+    livekit_identity: Option<String>,
+    #[serde(default)]
     openid_token: OpenIdTokenType,
 }
+
+const MAX_SHARE_ATTEMPT_ID_LEN: usize = 128;
 
 #[derive(Clone, Copy)]
 enum ShareAction {
@@ -1623,6 +1615,11 @@ fn matrix_error_for_share(error: ShareError) -> MatrixErrorResponse {
             403,
             "M_FORBIDDEN",
             "This participant cannot publish in the call",
+        ),
+        ShareError::Stale => (
+            409,
+            "IO.BABACOM.SHARE_STALE",
+            "This share attempt has already ended or been replaced",
         ),
     };
     MatrixErrorResponse {
@@ -1659,13 +1656,16 @@ async fn handle_share(handler: &Handler, req: Request, action: ShareAction) -> R
     if request.room_id.is_empty()
         || request.slot_id.is_empty()
         || request.member_id.is_empty()
+        || request.device_id.is_empty()
+        || request.attempt_id.is_empty()
+        || request.attempt_id.len() > MAX_SHARE_ATTEMPT_ID_LEN
         || request.openid_token.access_token.is_empty()
         || request.openid_token.matrix_server_name.is_empty()
     {
         return apply_cors_json(matrix_error_response(
             400,
             "M_BAD_JSON",
-            "The request is missing room, slot, member or OpenID token parameters",
+            "The request is missing room, slot, member, device, attempt or OpenID token parameters",
         ));
     }
 
@@ -1688,14 +1688,38 @@ async fn handle_share(handler: &Handler, req: Request, action: ShareAction) -> R
     }
 
     let room = livekit_room_alias_for(&request.room_id, &request.slot_id);
-    let identity = livekit_identity_for(&matrix_id, &request.member_id);
+    // The participant must be one this user's tokens address: the identity
+    // /get_token issues for (user, device, member), or the one /sfu/get
+    // issues for (user, device).
+    let matrix2_identity =
+        legacy_livekit_identity_for(&matrix_id, &request.device_id, &request.member_id);
+    let sfu_get_identity = LiveKitIdentity(format!("{matrix_id}:{}", request.device_id));
+    let identity = match request.livekit_identity {
+        None => matrix2_identity,
+        Some(claimed) if claimed == matrix2_identity.0 => matrix2_identity,
+        Some(claimed) if claimed == sfu_get_identity.0 => sfu_get_identity,
+        Some(_) => {
+            return apply_cors_json(matrix_error_response(
+                403,
+                "M_FORBIDDEN",
+                "The LiveKit identity does not belong to this user and device",
+            ));
+        }
+    };
     let arbiter = Arc::clone(handler.share_arbiter.get().expect("share route is enabled"));
     // Keep the room operation running if the HTTP client disconnects while
     // LiveKit is processing a permission change.
+    let attempt = request.attempt_id;
     let result = tokio::spawn(async move {
         match action {
-            ShareAction::Claim => arbiter.claim(&room.0, &identity.0).await.map(|()| "held"),
-            ShareAction::Release => arbiter.release(&room.0, &identity.0).await.map(|()| "free"),
+            ShareAction::Claim => arbiter
+                .claim(&room.0, &identity.0, &attempt)
+                .await
+                .map(|()| "held"),
+            ShareAction::Release => arbiter
+                .release(&room.0, &identity.0, &attempt)
+                .await
+                .map(|()| "free"),
         }
     })
     .await
@@ -2107,6 +2131,23 @@ pub(crate) fn sfu_event_from_webhook(
     }
 }
 
+/// Returns the participant whose screen rights the share arbiter must check:
+/// anyone joining (they may carry a refreshed token from an earlier share) and
+/// anyone publishing a screen track.
+pub(crate) fn share_enforcement_target(event: &livekit_protocol::WebhookEvent) -> Option<String> {
+    let participant = event.participant.as_ref()?;
+    match event.event.as_str() {
+        "participant_joined" => Some(participant.identity.clone()),
+        "track_published" => {
+            let source = event.track.as_ref()?.source;
+            (source == livekit_protocol::TrackSource::ScreenShare as i32
+                || source == livekit_protocol::TrackSource::ScreenShareAudio as i32)
+                .then(|| participant.identity.clone())
+        }
+        _ => None,
+    }
+}
+
 async fn handle_sfu_webhook(State(handler): State<Arc<Handler>>, req: Request) -> Response {
     let auth_token = req
         .headers()
@@ -2134,6 +2175,15 @@ async fn handle_sfu_webhook(State(handler): State<Arc<Handler>>, req: Request) -
             return StatusCode::OK.into_response();
         }
     };
+
+    if let Some(arbiter) = handler.share_arbiter.get()
+        && let Some(identity) = share_enforcement_target(&event)
+        && let Some(room) = event.room.as_ref()
+    {
+        let arbiter = Arc::clone(arbiter);
+        let room = room.name.clone();
+        tokio::spawn(async move { arbiter.enforce(&room, &identity).await });
+    }
 
     let Some((room_alias, msg)) = sfu_event_from_webhook(&event) else {
         return StatusCode::OK.into_response();
