@@ -1577,6 +1577,10 @@ struct ShareRequest {
     /// Client-chosen ID of one share attempt; claim and release must agree.
     #[serde(default)]
     attempt_id: String,
+    /// The LiveKit identity the client is connected with, when it is not the
+    /// Matrix 2.0 one, e.g. `user:device` from the legacy /sfu/get endpoint.
+    #[serde(default)]
+    livekit_identity: Option<String>,
     #[serde(default)]
     openid_token: OpenIdTokenType,
 }
@@ -1684,9 +1688,24 @@ async fn handle_share(handler: &Handler, req: Request, action: ShareAction) -> R
     }
 
     let room = livekit_room_alias_for(&request.room_id, &request.slot_id);
-    // Must match the identity /get_token issues and the one MatrixRTC clients
-    // derive from a membership: (user, device, member).
-    let identity = legacy_livekit_identity_for(&matrix_id, &request.device_id, &request.member_id);
+    // The participant must be one this user's tokens address: the identity
+    // /get_token issues for (user, device, member), or the one /sfu/get
+    // issues for (user, device).
+    let matrix2_identity =
+        legacy_livekit_identity_for(&matrix_id, &request.device_id, &request.member_id);
+    let sfu_get_identity = LiveKitIdentity(format!("{matrix_id}:{}", request.device_id));
+    let identity = match request.livekit_identity {
+        None => matrix2_identity,
+        Some(claimed) if claimed == matrix2_identity.0 => matrix2_identity,
+        Some(claimed) if claimed == sfu_get_identity.0 => sfu_get_identity,
+        Some(_) => {
+            return apply_cors_json(matrix_error_response(
+                403,
+                "M_FORBIDDEN",
+                "The LiveKit identity does not belong to this user and device",
+            ));
+        }
+    };
     let arbiter = Arc::clone(handler.share_arbiter.get().expect("share route is enabled"));
     // Keep the room operation running if the HTTP client disconnects while
     // LiveKit is processing a permission change.

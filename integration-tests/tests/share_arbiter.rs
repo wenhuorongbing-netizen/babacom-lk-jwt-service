@@ -258,6 +258,35 @@ async fn claim_targets_the_device_that_joined() {
 }
 
 #[tokio::test]
+async fn claim_accepts_only_this_users_sfu_get_identity() {
+    let hs = FakeHomeserver::new().await;
+    let alice = hs.new_user("alice");
+    let bob = hs.new_user("bob");
+    let sfu = FakeSfu::new().await;
+    let svc = start(&hs, &sfu, true).await;
+    // Joined through the legacy /sfu/get endpoint, which names participants user:device.
+    let legacy_identity = format!("{}:{DEVICE_ID}", alice.user_id);
+    sfu.set_participant_info(
+        &livekit_room_alias(ROOM_ID, SLOT_ID),
+        ParticipantInfo {
+            identity: legacy_identity.clone(),
+            permission: Some(base_permission()),
+            ..Default::default()
+        },
+    );
+
+    let mut not_hers = share_request(&hs, &alice);
+    not_hers["livekit_identity"] = json!(format!("{}:{DEVICE_ID}", bob.user_id));
+    let (status, body) = post(&svc, "/babacom/share/claim", &not_hers).await;
+    expect_matrix_error(status, &body, 403, "M_FORBIDDEN");
+
+    let mut request = share_request(&hs, &alice);
+    request["livekit_identity"] = json!(legacy_identity);
+    expect_state(post(&svc, "/babacom/share/claim", &request).await, "held");
+    expect_state(post(&svc, "/babacom/share/release", &request).await, "free");
+}
+
+#[tokio::test]
 async fn leave_webhook_checks_that_the_holder_is_absent() {
     let hs = FakeHomeserver::new().await;
     let alice = hs.new_user("alice");
