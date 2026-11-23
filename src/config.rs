@@ -26,6 +26,8 @@ pub struct Config {
     /// the sanity check entirely.
     /// Configure via LIVEKIT_SANITY_CHECK_INTERVAL_SECONDS (unit: seconds).
     pub sanity_check_interval: Duration,
+    /// Enables the BabaCom share arbiter with this revocation deadline.
+    pub share_revoke_timeout: Option<Duration>,
     /// Map of URLs for the Client-Server API keyed by server name. These will
     /// be preferred over .well-known resolution for the contained server names.
     pub cs_api_url_overrides: HashMap<String, CsApiUrl>,
@@ -248,6 +250,26 @@ pub fn parse_config() -> Result<Config, String> {
         }
     }
 
+    let share_arbiter_enabled = matches!(env_var("BABACOM_SHARE_ARBITER").as_str(), "true" | "1");
+    let share_revoke_timeout = if share_arbiter_enabled {
+        let raw = env_var("BABACOM_SHARE_REVOKE_TIMEOUT_MS");
+        let millis = if raw.is_empty() {
+            5000
+        } else {
+            match raw.parse::<u64>() {
+                Ok(millis) if millis > 0 => millis,
+                _ => {
+                    return Err(format!(
+                        "BABACOM_SHARE_REVOKE_TIMEOUT_MS must be a positive integer, got {raw:?}"
+                    ));
+                }
+            }
+        };
+        Some(Duration::from_millis(millis))
+    } else {
+        None
+    };
+
     let cs_api_url_overrides = read_cs_api_url_overrides(&env_var("LIVEKIT_CS_API_URL_OVERRIDES"))
         .map_err(|e| format!("failed parsing LIVEKIT_CS_API_URL_OVERRIDES: {e}"))?;
 
@@ -288,6 +310,7 @@ pub fn parse_config() -> Result<Config, String> {
             .collect(),
         lk_jwt_bind,
         sanity_check_interval,
+        share_revoke_timeout,
         cs_api_url_overrides,
         redis_url: redis_url_string,
         app_service_config,
@@ -721,6 +744,7 @@ mod tests {
                     full_access_homeservers: vec!["*".into()],
                     lk_jwt_bind: ":8080".into(),
                     sanity_check_interval: Duration::ZERO,
+                    share_revoke_timeout: None,
                     cs_api_url_overrides: HashMap::new(),
                     redis_url: String::new(),
                     app_service_config: Default::default(),
@@ -740,6 +764,8 @@ mod tests {
                         "YES_I_KNOW_WHAT_I_AM_DOING",
                     ),
                     ("LIVEKIT_SANITY_CHECK_INTERVAL_SECONDS", "30"),
+                    ("BABACOM_SHARE_ARBITER", "1"),
+                    ("BABACOM_SHARE_REVOKE_TIMEOUT_MS", "1500"),
                     (
                         "LIVEKIT_CS_API_URL_OVERRIDES",
                         "matrix.com=https://matrix-client.matrix.com",
@@ -761,6 +787,7 @@ mod tests {
                     full_access_homeservers: vec!["example.com".into(), "test.com".into()],
                     lk_jwt_bind: ":9090".into(),
                     sanity_check_interval: Duration::from_secs(30),
+                    share_revoke_timeout: Some(Duration::from_millis(1500)),
                     cs_api_url_overrides: HashMap::from([(
                         "matrix.com".to_owned(),
                         CsApiUrl("https://matrix-client.matrix.com".into()),
@@ -791,6 +818,7 @@ mod tests {
                     full_access_homeservers: vec!["*".into()],
                     lk_jwt_bind: ":9090".into(),
                     sanity_check_interval: Duration::ZERO,
+                    share_revoke_timeout: None,
                     cs_api_url_overrides: HashMap::new(),
                     redis_url: String::new(),
                     app_service_config: Default::default(),
@@ -870,6 +898,7 @@ mod tests {
                     full_access_homeservers: vec!["*".into()],
                     lk_jwt_bind: ":8080".into(),
                     sanity_check_interval: Duration::ZERO,
+                    share_revoke_timeout: None,
                     cs_api_url_overrides: HashMap::new(),
                     redis_url: String::new(),
                     app_service_config: Default::default(),
@@ -905,6 +934,7 @@ mod tests {
                     full_access_homeservers: vec!["*".into()],
                     lk_jwt_bind: ":8080".into(),
                     sanity_check_interval: Duration::ZERO,
+                    share_revoke_timeout: None,
                     cs_api_url_overrides: HashMap::new(),
                     redis_url: "redis://localhost:6379".to_owned(),
                     app_service_config: Default::default(),
@@ -931,6 +961,7 @@ mod tests {
                     full_access_homeservers: vec!["*".into()],
                     lk_jwt_bind: ":8080".into(),
                     sanity_check_interval: Duration::ZERO,
+                    share_revoke_timeout: None,
                     cs_api_url_overrides: HashMap::new(),
                     redis_url: "redis://:redis_cred_ua5ahg7ahruek4sho6ateeFe@localhost:6379"
                         .to_owned(),

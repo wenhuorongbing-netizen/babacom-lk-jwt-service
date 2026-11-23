@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE files in the repository root for full details.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,7 +11,7 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Json};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::post;
 use livekit_protocol as proto;
 use prost::Message;
@@ -37,9 +37,8 @@ struct SfuState {
     create_room_requests: Vec<CreateRoomRequest>,
     /// The recorded RoomService/GetParticipant requests.
     get_participant_requests: Vec<GetParticipantRequest>,
-    /// (room, identity) pairs currently considered present, per
-    /// RoomService/GetParticipant.
-    participants: HashSet<(String, String)>,
+    /// Current participants keyed by (room, identity).
+    participants: HashMap<(String, String), proto::ParticipantInfo>,
 }
 
 pub struct FakeSfu {
@@ -53,7 +52,6 @@ impl FakeSfu {
     pub async fn new() -> FakeSfu {
         let state = Arc::new(Mutex::new(SfuState::default()));
 
-        // Register the RoomService/CreateRoom and GetParticipant handlers.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind SFU listener");
@@ -66,6 +64,14 @@ impl FakeSfu {
             .route(
                 "/twirp/livekit.RoomService/GetParticipant",
                 post(handle_get_participant),
+            )
+            .route(
+                "/twirp/livekit.RoomService/ListParticipants",
+                post(handle_list_participants),
+            )
+            .route(
+                "/twirp/livekit.RoomService/UpdateParticipant",
+                post(handle_update_participant),
             )
             .with_state(Arc::clone(&state));
         tokio::spawn(axum::serve(listener, app).into_future());
@@ -94,7 +100,30 @@ impl FakeSfu {
             .lock()
             .unwrap()
             .participants
-            .insert((room.to_owned(), identity.to_owned()));
+            .entry((room.to_owned(), identity.to_owned()))
+            .or_insert_with(|| proto::ParticipantInfo {
+                identity: identity.to_owned(),
+                ..Default::default()
+            });
+    }
+
+    /// Set the participant record returned by the RoomService endpoints.
+    pub fn set_participant_info(&self, room: &str, info: proto::ParticipantInfo) {
+        self.state
+            .lock()
+            .unwrap()
+            .participants
+            .insert((room.to_owned(), info.identity.clone()), info);
+    }
+
+    /// Read the participant record directly from the fake SFU.
+    pub fn participant_info(&self, room: &str, identity: &str) -> Option<proto::ParticipantInfo> {
+        self.state
+            .lock()
+            .unwrap()
+            .participants
+            .get(&(room.to_owned(), identity.to_owned()))
+            .cloned()
     }
 
     /// Mark (room, identity) as absent, so GetParticipant returns NotFound
@@ -160,11 +189,7 @@ async fn handle_get_participant(
     body: Bytes,
 ) -> impl IntoResponse {
     let Ok(request) = proto::RoomParticipantIdentity::decode(body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "malformed", "msg": "invalid protobuf body" })),
-        )
-            .into_response();
+        return malformed_body();
     };
 
     let mut state = state.lock().unwrap();
@@ -173,24 +198,74 @@ async fn handle_get_participant(
         identity: request.identity.clone(),
     });
 
-    if state
-        .participants
-        .contains(&(request.room.clone(), request.identity.clone()))
-    {
-        let info = proto::ParticipantInfo {
-            identity: request.identity,
-            ..Default::default()
-        };
-        (
-            [(header::CONTENT_TYPE, "application/protobuf")],
-            info.encode_to_vec(),
-        )
-            .into_response()
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "code": "not_found", "msg": "participant not found" })),
-        )
-            .into_response()
+    match state.participants.get(&(request.room, request.identity)) {
+        Some(info) => protobuf_response(info),
+        None => participant_not_found(),
     }
+}
+
+/// Handler for RoomService/ListParticipants requests.
+async fn handle_list_participants(
+    State(state): State<Arc<Mutex<SfuState>>>,
+    body: Bytes,
+) -> Response {
+    let Ok(request) = proto::ListParticipantsRequest::decode(body) else {
+        return malformed_body();
+    };
+
+    let state = state.lock().unwrap();
+    let participants = state
+        .participants
+        .iter()
+        .filter(|((room, _), _)| room.as_str() == request.room.as_str())
+        .map(|(_, info)| info.clone())
+        .collect();
+    protobuf_response(&proto::ListParticipantsResponse { participants })
+}
+
+/// Handler for RoomService/UpdateParticipant permission updates.
+async fn handle_update_participant(
+    State(state): State<Arc<Mutex<SfuState>>>,
+    body: Bytes,
+) -> Response {
+    let Ok(request) = proto::UpdateParticipantRequest::decode(body) else {
+        return malformed_body();
+    };
+
+    let mut state = state.lock().unwrap();
+    let Some(info) = state
+        .participants
+        .get_mut(&(request.room, request.identity))
+    else {
+        return participant_not_found();
+    };
+    if let Some(permission) = request.permission {
+        info.permission = Some(permission);
+    }
+    // Track removal is controlled separately by the test to model a lagging SFU.
+    protobuf_response(info)
+}
+
+fn protobuf_response(message: &impl Message) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/protobuf")],
+        message.encode_to_vec(),
+    )
+        .into_response()
+}
+
+fn malformed_body() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "code": "malformed", "msg": "invalid protobuf body" })),
+    )
+        .into_response()
+}
+
+fn participant_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "code": "not_found", "msg": "participant not found" })),
+    )
+        .into_response()
 }
