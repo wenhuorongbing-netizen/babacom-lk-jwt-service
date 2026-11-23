@@ -92,6 +92,10 @@ async fn main() {
         }),
     );
 
+    if let Some(revoke_timeout) = config.share_revoke_timeout {
+        handler.enable_share_arbiter(revoke_timeout);
+    }
+
     if handler.verifies_legacy_membership() {
         info!(
             "/sfu/get, /get_token and /delegate_delayed_leave verify room membership through the homeserver"

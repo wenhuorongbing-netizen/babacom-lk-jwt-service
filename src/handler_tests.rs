@@ -679,11 +679,16 @@ async fn test_get_join_token() {
         &LiveKitRoomAlias("testRoom".into()),
         &LiveKitIdentity("testIdentity@example.com".into()),
         true,
+        false,
     )
     .expect("unexpected error");
     assert!(!token_string.is_empty(), "expected token to be non-empty");
 
     let claims = parse_jwt_claims(&token_string, "testSecret");
+    assert!(
+        claims["video"]["canPublishSources"].is_null()
+            || claims["video"]["canPublishSources"] == serde_json::json!([])
+    );
     assert_ne!(
         claims["video"]["roomCreate"],
         serde_json::Value::Bool(true),
@@ -709,6 +714,7 @@ async fn test_get_join_token_can_publish_false() {
         &LiveKitRoomAlias("testRoom".into()),
         &LiveKitIdentity("testIdentity@example.com".into()),
         false,
+        false,
     )
     .expect("unexpected error");
 
@@ -718,6 +724,26 @@ async fn test_get_join_token_can_publish_false() {
         serde_json::Value::Bool(true),
         "canPublish must reflect the passed-in flag"
     );
+}
+
+#[tokio::test]
+async fn test_get_join_token_restricts_sources_when_share_arbiter_is_enabled() {
+    for can_publish in [true, false] {
+        let token = get_join_token(
+            "testKey",
+            "testSecret",
+            &LiveKitRoomAlias("testRoom".into()),
+            &LiveKitIdentity("testIdentity@example.com".into()),
+            can_publish,
+            true,
+        )
+        .unwrap();
+        let claims = parse_jwt_claims(&token, "testSecret");
+        assert_eq!(
+            claims["video"]["canPublishSources"],
+            serde_json::json!(["camera", "microphone"])
+        );
+    }
 }
 
 // ── Handler loop internals ────────────────────────────────────────────────────

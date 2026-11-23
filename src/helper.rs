@@ -14,6 +14,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
+use livekit_protocol::{
+    ListParticipantsRequest, ListParticipantsResponse, ParticipantInfo, ParticipantPermission,
+    RoomParticipantIdentity, UpdateParticipantRequest,
+};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -286,7 +290,25 @@ pub enum RoomServiceError {
 #[async_trait]
 pub trait RoomServiceClient: Send + Sync {
     async fn create_room(&self, params: CreateRoomParams) -> Result<RoomInfo, RoomServiceError>;
-    async fn get_participant(&self, room: &str, identity: &str) -> Result<(), RoomServiceError>;
+
+    /// Lists the participants currently connected to the room.
+    async fn list_participants(&self, room: &str)
+    -> Result<Vec<ParticipantInfo>, RoomServiceError>;
+
+    /// Reads the participant's current profile, permissions and published tracks.
+    async fn get_participant(
+        &self,
+        room: &str,
+        identity: &str,
+    ) -> Result<ParticipantInfo, RoomServiceError>;
+
+    /// Replaces the participant's publish and subscribe permissions.
+    async fn update_participant_permission(
+        &self,
+        room: &str,
+        identity: &str,
+        permission: ParticipantPermission,
+    ) -> Result<ParticipantInfo, RoomServiceError>;
 }
 
 /// Converts a LiveKit URL to its HTTP form: ws:// becomes http://, wss://
@@ -306,7 +328,7 @@ pub(crate) fn to_http_url(url: &str) -> String {
 /// TODO(upstream): livekit-api's `RoomClient` builds request URLs with
 /// `url.set_path(...)`, which strips any reverse-proxy path prefix in
 /// LIVEKIT_URL, and it does not convert ws/wss schemes for HTTP calls. The
-/// two RoomService Twirp calls are therefore issued directly here; the SDK
+/// RoomService Twirp calls are therefore issued directly here; the SDK
 /// is still used for access tokens and webhook verification.
 struct LiveKitRoomServiceClient {
     /// The http(s) base URL, possibly carrying a path prefix.
@@ -415,23 +437,68 @@ impl RoomServiceClient for LiveKitRoomServiceClient {
         })
     }
 
-    async fn get_participant(&self, room: &str, identity: &str) -> Result<(), RoomServiceError> {
-        let _: livekit_protocol::ParticipantInfo = self
+    async fn list_participants(
+        &self,
+        room: &str,
+    ) -> Result<Vec<ParticipantInfo>, RoomServiceError> {
+        let response: ListParticipantsResponse = self
             .twirp_call(
-                "GetParticipant",
+                "ListParticipants",
                 livekit_api::access_token::VideoGrants {
                     room_admin: true,
                     room: room.to_owned(),
                     ..Default::default()
                 },
-                livekit_protocol::RoomParticipantIdentity {
+                ListParticipantsRequest {
                     room: room.to_owned(),
-                    identity: identity.to_owned(),
-                    ..Default::default()
                 },
             )
             .await?;
-        Ok(())
+        Ok(response.participants)
+    }
+
+    async fn get_participant(
+        &self,
+        room: &str,
+        identity: &str,
+    ) -> Result<ParticipantInfo, RoomServiceError> {
+        self.twirp_call(
+            "GetParticipant",
+            livekit_api::access_token::VideoGrants {
+                room_admin: true,
+                room: room.to_owned(),
+                ..Default::default()
+            },
+            RoomParticipantIdentity {
+                room: room.to_owned(),
+                identity: identity.to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn update_participant_permission(
+        &self,
+        room: &str,
+        identity: &str,
+        permission: ParticipantPermission,
+    ) -> Result<ParticipantInfo, RoomServiceError> {
+        self.twirp_call(
+            "UpdateParticipant",
+            livekit_api::access_token::VideoGrants {
+                room_admin: true,
+                room: room.to_owned(),
+                ..Default::default()
+            },
+            UpdateParticipantRequest {
+                room: room.to_owned(),
+                identity: identity.to_owned(),
+                permission: Some(permission),
+                ..Default::default()
+            },
+        )
+        .await
     }
 }
 
@@ -739,7 +806,7 @@ pub trait Deps: Send + Sync {
         let room_client =
             self.new_room_service_client(&lk_auth.lk_url, &lk_auth.key, &lk_auth.secret);
         match room_client.get_participant(&room.0, &identity.0).await {
-            Ok(()) => Ok(true),
+            Ok(_) => Ok(true),
             Err(RoomServiceError::NotFound(_)) => Ok(false),
             Err(err) => Err(err.to_string()),
         }
@@ -2906,15 +2973,34 @@ mod tests {
             }
         }
 
+        async fn list_participants(
+            &self,
+            _room: &str,
+        ) -> Result<Vec<ParticipantInfo>, RoomServiceError> {
+            unreachable!("this mock does not list participants")
+        }
+
         async fn get_participant(
             &self,
             room: &str,
             identity: &str,
-        ) -> Result<(), RoomServiceError> {
-            match &self.get_participant_fn {
-                Some(f) => f(room, identity),
-                None => Ok(()),
+        ) -> Result<ParticipantInfo, RoomServiceError> {
+            if let Some(f) = &self.get_participant_fn {
+                f(room, identity)?;
             }
+            Ok(ParticipantInfo {
+                identity: identity.to_owned(),
+                ..Default::default()
+            })
+        }
+
+        async fn update_participant_permission(
+            &self,
+            _room: &str,
+            _identity: &str,
+            _permission: ParticipantPermission,
+        ) -> Result<ParticipantInfo, RoomServiceError> {
+            unreachable!("this mock does not update permissions")
         }
     }
 

@@ -9,4 +9,5 @@ pub mod handler;
 pub mod helper;
 pub mod requests;
 pub mod retry;
+mod share_arbiter;
 pub mod store;

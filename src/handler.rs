@@ -7,7 +7,7 @@
 //! the actor loop that owns the delayed-event jobs.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 #[cfg(feature = "appservice-ping-trigger")]
@@ -44,6 +44,7 @@ use crate::requests::{
     GetTokenCsRequest, GetTokenCsResponse, GetTokenSsRequest, GetTokenSsResponse, LegacySfuRequest,
     MatrixErrorBody, MatrixErrorResponse, OpenIdTokenType, SfuRequest, SfuResponse,
 };
+use crate::share_arbiter::{ShareArbiter, ShareError};
 use crate::store::{Store, StoredJob};
 
 /// Mints the LiveKit join JWT for a (room, identity) pair.
@@ -53,8 +54,9 @@ pub fn get_join_token(
     room: &LiveKitRoomAlias,
     identity: &LiveKitIdentity,
     can_publish: bool,
+    share_arbiter_enabled: bool,
 ) -> Result<String, String> {
-    let grants = VideoGrants {
+    let mut grants = VideoGrants {
         room_join: true,
         room_create: false,
         can_publish,
@@ -64,6 +66,9 @@ pub fn get_join_token(
         room: room.0.clone(),
         ..Default::default()
     };
+    if share_arbiter_enabled {
+        grants.can_publish_sources = vec!["camera".into(), "microphone".into()];
+    }
 
     AccessToken::with_api_key(api_key, api_secret)
         .with_grants(grants)
@@ -169,6 +174,7 @@ pub struct Handler {
     cs_api_url_cache: Arc<CsApiUrlCache>,
     store: Option<Arc<dyn Store>>,
     deps: Arc<dyn Deps>,
+    share_arbiter: OnceLock<Arc<ShareArbiter>>,
     /// Set to true when run_loop has exited.
     loop_done_tx: watch::Sender<bool>,
     /// Set to true once start-up recovery of previously stored jobs is
@@ -240,6 +246,7 @@ impl Handler {
             cs_api_url_cache: Arc::new(CsApiUrlCache::new()),
             store,
             deps,
+            share_arbiter: OnceLock::new(),
             loop_done_tx,
             recovery_done_tx,
             job_done_tx,
@@ -256,6 +263,18 @@ impl Handler {
                 job_restarted_rx,
             },
         )
+    }
+
+    /// Enables server-side screen-share arbitration before the router is prepared.
+    pub fn enable_share_arbiter(&self, revoke_timeout: Duration) {
+        self.share_arbiter.get_or_init(|| {
+            let auth = &self.livekit_auth;
+            Arc::new(ShareArbiter::new(
+                self.deps
+                    .new_room_service_client(&auth.lk_url, &auth.key, &auth.secret),
+                revoke_timeout,
+            ))
+        });
     }
 
     /// A watch receiver that flips to true once start-up recovery completed.
@@ -807,6 +826,7 @@ impl Handler {
             lk_room_alias,
             lk_identity,
             can_publish,
+            self.share_arbiter.get().is_some(),
         )
         .map_err(|err| {
             error!(matrix_id, err = %err, "Handler: error getting LiveKit token");
@@ -915,6 +935,14 @@ impl Handler {
         if !self.verifies_legacy_membership {
             return Ok(());
         }
+        self.verify_room_membership(matrix_id, room_id).await
+    }
+
+    async fn verify_room_membership(
+        &self,
+        matrix_id: &str,
+        room_id: &str,
+    ) -> Result<(), MatrixErrorResponse> {
         // Use the `hs_server_name` we are configured for rather than the one
         // specified in the OpenID token.
         let hs_server_name = &self.app_service_config.hs_server_name;
@@ -942,6 +970,19 @@ impl Handler {
             "The requesting user is not a member of the room",
         )
         .await
+    }
+
+    fn standalone_livekit_identity(
+        &self,
+        matrix_id: &str,
+        device_id: &str,
+        member_id: &str,
+    ) -> LiveKitIdentity {
+        if self.share_arbiter.get().is_some() {
+            livekit_identity_for(matrix_id, member_id)
+        } else {
+            legacy_livekit_identity_for(matrix_id, device_id, member_id)
+        }
     }
 
     /// Deprecated: serves the pre-Matrix-2.0 /sfu/get endpoint. Remove once
@@ -1050,8 +1091,11 @@ impl Handler {
         self.enforce_legacy_membership(&matrix_id, &req.room_id)
             .await?;
 
-        let lk_identity =
-            legacy_livekit_identity_for(&matrix_id, &req.member.claimed_device_id, &req.member.id);
+        let lk_identity = self.standalone_livekit_identity(
+            &matrix_id,
+            &req.member.claimed_device_id,
+            &req.member.id,
+        );
         let lk_room_alias = livekit_room_alias_for(&req.room_id, &req.slot_id);
 
         let token = self.get_join_token_or_internal_error(
@@ -1301,8 +1345,11 @@ impl Handler {
         self.enforce_legacy_membership(&matrix_id, &req.room_id)
             .await?;
 
-        let lk_identity =
-            legacy_livekit_identity_for(&matrix_id, &req.member.claimed_device_id, &req.member.id);
+        let lk_identity = self.standalone_livekit_identity(
+            &matrix_id,
+            &req.member.claimed_device_id,
+            &req.member.id,
+        );
         let lk_room_alias = livekit_room_alias_for(&req.room_id, &req.slot_id);
 
         // Verify that the Client-Server API can be resolved and prime the
@@ -1396,6 +1443,12 @@ impl Handler {
             )
             .route("/sfu_webhook", any(handle_sfu_webhook))
             .route("/healthz", any(healthcheck));
+
+        if self.share_arbiter.get().is_some() {
+            router = router
+                .route("/babacom/share/claim", any(handle_share_claim))
+                .route("/babacom/share/release", any(handle_share_release));
+        }
 
         if self.app_service_config.is_set_up() {
             router = router
@@ -1528,6 +1581,132 @@ fn gate_post(req: Request) -> PostGate {
         Method::POST => PostGate::Handle(req),
         _ => PostGate::Reply(StatusCode::METHOD_NOT_ALLOWED.into_response()),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct ShareRequest {
+    #[serde(default)]
+    room_id: String,
+    #[serde(default)]
+    slot_id: String,
+    #[serde(default)]
+    member_id: String,
+    #[serde(default)]
+    openid_token: OpenIdTokenType,
+}
+
+#[derive(Clone, Copy)]
+enum ShareAction {
+    Claim,
+    Release,
+}
+
+fn matrix_error_for_share(error: ShareError) -> MatrixErrorResponse {
+    let (status, errcode, message) = match error {
+        ShareError::Busy => (
+            409,
+            "IO.BABACOM.SHARE_BUSY",
+            "Another participant holds the screen share",
+        ),
+        ShareError::Unknown => (
+            409,
+            "IO.BABACOM.SHARE_UNKNOWN",
+            "Screen-share state is unknown",
+        ),
+        ShareError::NotInCall => (409, "IO.BABACOM.NOT_IN_CALL", "Join the call first"),
+        ShareError::SfuUnavailable => (
+            503,
+            "IO.BABACOM.SFU_UNAVAILABLE",
+            "Unable to verify or update screen-share permissions on the SFU",
+        ),
+        ShareError::Forbidden => (
+            403,
+            "M_FORBIDDEN",
+            "This participant cannot publish in the call",
+        ),
+    };
+    MatrixErrorResponse {
+        status,
+        errcode: errcode.into(),
+        err: message.into(),
+    }
+}
+
+async fn handle_share_claim(State(handler): State<Arc<Handler>>, req: Request) -> Response {
+    handle_share(&handler, req, ShareAction::Claim).await
+}
+
+async fn handle_share_release(State(handler): State<Arc<Handler>>, req: Request) -> Response {
+    handle_share(&handler, req, ShareAction::Release).await
+}
+
+async fn handle_share(handler: &Handler, req: Request, action: ShareAction) -> Response {
+    let req = match gate_post(req) {
+        PostGate::Handle(req) => req,
+        PostGate::Reply(resp) => return apply_cors_json(resp),
+    };
+    let request: ShareRequest = match decode_json_body(req).await {
+        Ok(request) => request,
+        Err(err) => {
+            debug!(%err, "Handler: error reading share request");
+            return apply_cors_json(matrix_error_response(
+                400,
+                "M_NOT_JSON",
+                "Error reading request",
+            ));
+        }
+    };
+    if request.room_id.is_empty()
+        || request.slot_id.is_empty()
+        || request.member_id.is_empty()
+        || request.openid_token.access_token.is_empty()
+        || request.openid_token.matrix_server_name.is_empty()
+    {
+        return apply_cors_json(matrix_error_response(
+            400,
+            "M_BAD_JSON",
+            "The request is missing room, slot, member or OpenID token parameters",
+        ));
+    }
+
+    let matrix_id = match handler.verify_openid_token(&request.openid_token, "").await {
+        Ok(matrix_id) => matrix_id,
+        Err(err) => return apply_cors_json(matrix_error_into_response(&err)),
+    };
+    if !handler.app_service_config.is_set_up() {
+        return apply_cors_json(matrix_error_response(
+            502,
+            "M_UNKNOWN",
+            "Unable to verify room membership",
+        ));
+    }
+    if let Err(err) = handler
+        .verify_room_membership(&matrix_id, &request.room_id)
+        .await
+    {
+        return apply_cors_json(matrix_error_into_response(&err));
+    }
+
+    let room = livekit_room_alias_for(&request.room_id, &request.slot_id);
+    let identity = livekit_identity_for(&matrix_id, &request.member_id);
+    let arbiter = Arc::clone(handler.share_arbiter.get().expect("share route is enabled"));
+    // Keep the room operation running if the HTTP client disconnects while
+    // LiveKit is processing a permission change.
+    let result = tokio::spawn(async move {
+        match action {
+            ShareAction::Claim => arbiter.claim(&room.0, &identity.0).await.map(|()| "held"),
+            ShareAction::Release => arbiter.release(&room.0, &identity.0).await.map(|()| "free"),
+        }
+    })
+    .await
+    .unwrap_or_else(|err| {
+        error!(%err, "Handler: share arbiter task failed");
+        Err(ShareError::SfuUnavailable)
+    });
+    apply_cors_json(match result {
+        Ok(state) => Json(serde_json::json!({ "state": state })).into_response(),
+        Err(err) => matrix_error_into_response(&matrix_error_for_share(err)),
+    })
 }
 
 /// Deprecated: serves the pre-Matrix-2.0 /sfu/get endpoint. Remove once all
@@ -1959,6 +2138,18 @@ async fn handle_sfu_webhook(State(handler): State<Arc<Handler>>, req: Request) -
     let Some((room_alias, msg)) = sfu_event_from_webhook(&event) else {
         return StatusCode::OK.into_response();
     };
+
+    if matches!(
+        msg.signal,
+        DelayedEventSignal::ParticipantDisconnectedIntentionally
+            | DelayedEventSignal::ParticipantConnectionAborted
+    ) && let Some(arbiter) = handler.share_arbiter.get()
+    {
+        let arbiter = Arc::clone(arbiter);
+        let room = room_alias.clone();
+        let identity = msg.livekit_identity.clone();
+        tokio::spawn(async move { arbiter.participant_left(&room.0, &identity.0).await });
+    }
 
     // Route via the loop so the map is accessed by a single task only.
     tokio::select! {
