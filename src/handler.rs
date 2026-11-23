@@ -1574,9 +1574,14 @@ struct ShareRequest {
     member_id: String,
     #[serde(default)]
     device_id: String,
+    /// Client-chosen ID of one share attempt; claim and release must agree.
+    #[serde(default)]
+    attempt_id: String,
     #[serde(default)]
     openid_token: OpenIdTokenType,
 }
+
+const MAX_SHARE_ATTEMPT_ID_LEN: usize = 128;
 
 #[derive(Clone, Copy)]
 enum ShareAction {
@@ -1606,6 +1611,11 @@ fn matrix_error_for_share(error: ShareError) -> MatrixErrorResponse {
             403,
             "M_FORBIDDEN",
             "This participant cannot publish in the call",
+        ),
+        ShareError::Stale => (
+            409,
+            "IO.BABACOM.SHARE_STALE",
+            "This share attempt has already ended or been replaced",
         ),
     };
     MatrixErrorResponse {
@@ -1643,13 +1653,15 @@ async fn handle_share(handler: &Handler, req: Request, action: ShareAction) -> R
         || request.slot_id.is_empty()
         || request.member_id.is_empty()
         || request.device_id.is_empty()
+        || request.attempt_id.is_empty()
+        || request.attempt_id.len() > MAX_SHARE_ATTEMPT_ID_LEN
         || request.openid_token.access_token.is_empty()
         || request.openid_token.matrix_server_name.is_empty()
     {
         return apply_cors_json(matrix_error_response(
             400,
             "M_BAD_JSON",
-            "The request is missing room, slot, member, device or OpenID token parameters",
+            "The request is missing room, slot, member, device, attempt or OpenID token parameters",
         ));
     }
 
@@ -1678,10 +1690,17 @@ async fn handle_share(handler: &Handler, req: Request, action: ShareAction) -> R
     let arbiter = Arc::clone(handler.share_arbiter.get().expect("share route is enabled"));
     // Keep the room operation running if the HTTP client disconnects while
     // LiveKit is processing a permission change.
+    let attempt = request.attempt_id;
     let result = tokio::spawn(async move {
         match action {
-            ShareAction::Claim => arbiter.claim(&room.0, &identity.0).await.map(|()| "held"),
-            ShareAction::Release => arbiter.release(&room.0, &identity.0).await.map(|()| "free"),
+            ShareAction::Claim => arbiter
+                .claim(&room.0, &identity.0, &attempt)
+                .await
+                .map(|()| "held"),
+            ShareAction::Release => arbiter
+                .release(&room.0, &identity.0, &attempt)
+                .await
+                .map(|()| "free"),
         }
     })
     .await
@@ -2093,6 +2112,23 @@ pub(crate) fn sfu_event_from_webhook(
     }
 }
 
+/// Returns the participant whose screen rights the share arbiter must check:
+/// anyone joining (they may carry a refreshed token from an earlier share) and
+/// anyone publishing a screen track.
+pub(crate) fn share_enforcement_target(event: &livekit_protocol::WebhookEvent) -> Option<String> {
+    let participant = event.participant.as_ref()?;
+    match event.event.as_str() {
+        "participant_joined" => Some(participant.identity.clone()),
+        "track_published" => {
+            let source = event.track.as_ref()?.source;
+            (source == livekit_protocol::TrackSource::ScreenShare as i32
+                || source == livekit_protocol::TrackSource::ScreenShareAudio as i32)
+                .then(|| participant.identity.clone())
+        }
+        _ => None,
+    }
+}
+
 async fn handle_sfu_webhook(State(handler): State<Arc<Handler>>, req: Request) -> Response {
     let auth_token = req
         .headers()
@@ -2120,6 +2156,15 @@ async fn handle_sfu_webhook(State(handler): State<Arc<Handler>>, req: Request) -
             return StatusCode::OK.into_response();
         }
     };
+
+    if let Some(arbiter) = handler.share_arbiter.get()
+        && let Some(identity) = share_enforcement_target(&event)
+        && let Some(room) = event.room.as_ref()
+    {
+        let arbiter = Arc::clone(arbiter);
+        let room = room.name.clone();
+        tokio::spawn(async move { arbiter.enforce(&room, &identity).await });
+    }
 
     let Some((room_alias, msg)) = sfu_event_from_webhook(&event) else {
         return StatusCode::OK.into_response();

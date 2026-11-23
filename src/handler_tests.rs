@@ -5429,3 +5429,42 @@ async fn test_membership_skipped_unless_hs_is_the_only_full_access_homeserver() 
         handler.close().await;
     }
 }
+
+#[test]
+fn share_enforcement_targets_joins_and_screen_publications() {
+    let event = |kind: &str, source: Option<livekit_protocol::TrackSource>| {
+        livekit_protocol::WebhookEvent {
+            event: kind.into(),
+            participant: Some(livekit_protocol::ParticipantInfo {
+                identity: "alice".into(),
+                ..Default::default()
+            }),
+            track: source.map(|source| livekit_protocol::TrackInfo {
+                source: source as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    };
+    use livekit_protocol::TrackSource::{Microphone, ScreenShare, ScreenShareAudio};
+    assert_eq!(
+        share_enforcement_target(&event("participant_joined", None)),
+        Some("alice".into())
+    );
+    assert_eq!(
+        share_enforcement_target(&event("track_published", Some(ScreenShare))),
+        Some("alice".into())
+    );
+    assert_eq!(
+        share_enforcement_target(&event("track_published", Some(ScreenShareAudio))),
+        Some("alice".into())
+    );
+    assert_eq!(
+        share_enforcement_target(&event("track_published", Some(Microphone))),
+        None
+    );
+    assert_eq!(
+        share_enforcement_target(&event("participant_left", None)),
+        None
+    );
+}

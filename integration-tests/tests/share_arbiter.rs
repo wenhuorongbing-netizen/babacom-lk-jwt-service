@@ -24,6 +24,7 @@ fn share_request(hs: &FakeHomeserver, user: &FakeUser) -> Value {
         "slot_id": SLOT_ID,
         "member_id": MEMBER_ID,
         "device_id": DEVICE_ID,
+        "attempt_id": format!("{}-1", user.user_id),
         "openid_token": {
             "access_token": user.openid_token,
             "token_type": "Bearer",
@@ -78,6 +79,7 @@ async fn join(svc: &Service, sfu: &FakeSfu, hs: &FakeHomeserver, user: &FakeUser
     let fields = request.as_object_mut().unwrap();
     fields.remove("member_id");
     fields.remove("device_id");
+    fields.remove("attempt_id");
     request["member"] = json!({
         "id": MEMBER_ID,
         "claimed_user_id": user.user_id,
@@ -293,6 +295,77 @@ async fn leave_webhook_checks_that_the_holder_is_absent() {
         post(&svc, "/babacom/share/claim", &share_request(&hs, &bob)).await,
         "held",
     );
+}
+
+#[tokio::test]
+async fn a_claim_that_arrives_after_its_release_is_refused() {
+    let hs = FakeHomeserver::new().await;
+    let alice = hs.new_user("alice");
+    let sfu = FakeSfu::new().await;
+    let svc = start(&hs, &sfu, true).await;
+    join(&svc, &sfu, &hs, &alice).await;
+    let request = share_request(&hs, &alice);
+
+    expect_state(post(&svc, "/babacom/share/release", &request).await, "free");
+    let (status, body) = post(&svc, "/babacom/share/claim", &request).await;
+    expect_matrix_error(status, &body, 409, "IO.BABACOM.SHARE_STALE");
+
+    let mut next_attempt = request;
+    next_attempt["attempt_id"] = json!("alice-2");
+    expect_state(
+        post(&svc, "/babacom/share/claim", &next_attempt).await,
+        "held",
+    );
+}
+
+#[tokio::test]
+async fn a_rejoin_with_stale_screen_rights_is_stripped() {
+    let hs = FakeHomeserver::new().await;
+    let alice = hs.new_user("alice");
+    let bob = hs.new_user("bob");
+    let sfu = FakeSfu::new().await;
+    let svc = start(&hs, &sfu, true).await;
+    let room = livekit_room_alias(ROOM_ID, SLOT_ID);
+    let alice_identity = join(&svc, &sfu, &hs, &alice).await;
+    let bob_identity = join(&svc, &sfu, &hs, &bob).await;
+    expect_state(
+        post(&svc, "/babacom/share/claim", &share_request(&hs, &bob)).await,
+        "held",
+    );
+
+    // Alice reconnects with a refreshed token from an earlier share.
+    let screen_sources = vec![
+        TrackSource::Camera as i32,
+        TrackSource::Microphone as i32,
+        TrackSource::ScreenShare as i32,
+        TrackSource::ScreenShareAudio as i32,
+    ];
+    sfu.set_participant_info(
+        &room,
+        ParticipantInfo {
+            identity: alice_identity.clone(),
+            permission: Some(ParticipantPermission {
+                can_publish_sources: screen_sources.clone(),
+                ..base_permission()
+            }),
+            ..Default::default()
+        },
+    );
+    send_sfu_webhook(&svc, "participant_joined", &room, &alice_identity, None).await;
+
+    let sources = |identity: &str| {
+        sfu.participant_info(&room, identity)
+            .and_then(|info| info.permission)
+            .map(|permission| permission.can_publish_sources)
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while sources(&alice_identity) != Some(base_permission().can_publish_sources) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the stale screen rights should be removed");
+    assert_eq!(sources(&bob_identity), Some(screen_sources));
 }
 
 #[tokio::test]
