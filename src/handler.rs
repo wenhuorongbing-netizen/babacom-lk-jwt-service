@@ -972,19 +972,6 @@ impl Handler {
         .await
     }
 
-    fn standalone_livekit_identity(
-        &self,
-        matrix_id: &str,
-        device_id: &str,
-        member_id: &str,
-    ) -> LiveKitIdentity {
-        if self.share_arbiter.get().is_some() {
-            livekit_identity_for(matrix_id, member_id)
-        } else {
-            legacy_livekit_identity_for(matrix_id, device_id, member_id)
-        }
-    }
-
     /// Deprecated: serves the pre-Matrix-2.0 /sfu/get endpoint. Remove once
     /// all in-the-wild clients have migrated to /get_token.
     pub(crate) async fn process_legacy_sfu_request(
@@ -1091,11 +1078,8 @@ impl Handler {
         self.enforce_legacy_membership(&matrix_id, &req.room_id)
             .await?;
 
-        let lk_identity = self.standalone_livekit_identity(
-            &matrix_id,
-            &req.member.claimed_device_id,
-            &req.member.id,
-        );
+        let lk_identity =
+            legacy_livekit_identity_for(&matrix_id, &req.member.claimed_device_id, &req.member.id);
         let lk_room_alias = livekit_room_alias_for(&req.room_id, &req.slot_id);
 
         let token = self.get_join_token_or_internal_error(
@@ -1345,11 +1329,8 @@ impl Handler {
         self.enforce_legacy_membership(&matrix_id, &req.room_id)
             .await?;
 
-        let lk_identity = self.standalone_livekit_identity(
-            &matrix_id,
-            &req.member.claimed_device_id,
-            &req.member.id,
-        );
+        let lk_identity =
+            legacy_livekit_identity_for(&matrix_id, &req.member.claimed_device_id, &req.member.id);
         let lk_room_alias = livekit_room_alias_for(&req.room_id, &req.slot_id);
 
         // Verify that the Client-Server API can be resolved and prime the
@@ -1592,6 +1573,8 @@ struct ShareRequest {
     #[serde(default)]
     member_id: String,
     #[serde(default)]
+    device_id: String,
+    #[serde(default)]
     openid_token: OpenIdTokenType,
 }
 
@@ -1659,13 +1642,14 @@ async fn handle_share(handler: &Handler, req: Request, action: ShareAction) -> R
     if request.room_id.is_empty()
         || request.slot_id.is_empty()
         || request.member_id.is_empty()
+        || request.device_id.is_empty()
         || request.openid_token.access_token.is_empty()
         || request.openid_token.matrix_server_name.is_empty()
     {
         return apply_cors_json(matrix_error_response(
             400,
             "M_BAD_JSON",
-            "The request is missing room, slot, member or OpenID token parameters",
+            "The request is missing room, slot, member, device or OpenID token parameters",
         ));
     }
 
@@ -1688,7 +1672,9 @@ async fn handle_share(handler: &Handler, req: Request, action: ShareAction) -> R
     }
 
     let room = livekit_room_alias_for(&request.room_id, &request.slot_id);
-    let identity = livekit_identity_for(&matrix_id, &request.member_id);
+    // Must match the identity /get_token issues and the one MatrixRTC clients
+    // derive from a membership: (user, device, member).
+    let identity = legacy_livekit_identity_for(&matrix_id, &request.device_id, &request.member_id);
     let arbiter = Arc::clone(handler.share_arbiter.get().expect("share route is enabled"));
     // Keep the room operation running if the HTTP client disconnects while
     // LiveKit is processing a permission change.

@@ -9,19 +9,21 @@ use livekit_protocol::{ParticipantInfo, ParticipantPermission, TrackInfo, TrackS
 use lk_jwt_service_integration_tests::{
     APP_SERVICE_AS_TOKEN, FakeHomeserver, FakeSfu, FakeUser, Service, ServiceConfig,
     app_service_env, decode_livekit_jwt, expect_is_joined_request, expect_matrix_error,
-    livekit_identity, livekit_room_alias, send_sfu_webhook,
+    legacy_livekit_identity, livekit_room_alias, send_sfu_webhook,
 };
 use serde_json::{Value, json};
 
 const ROOM_ID: &str = "!room:example.com";
 const SLOT_ID: &str = "m.call#ROOM";
 const MEMBER_ID: &str = "member-1";
+const DEVICE_ID: &str = "DEVICE";
 
 fn share_request(hs: &FakeHomeserver, user: &FakeUser) -> Value {
     json!({
         "room_id": ROOM_ID,
         "slot_id": SLOT_ID,
         "member_id": MEMBER_ID,
+        "device_id": DEVICE_ID,
         "openid_token": {
             "access_token": user.openid_token,
             "token_type": "Bearer",
@@ -66,15 +68,20 @@ fn base_permission() -> ParticipantPermission {
 }
 
 /// Request a standalone join JWT, then simulate the participant joining the SFU.
+///
+/// The JWT identity must be the one MatrixRTC clients derive from a membership
+/// (user, device, member); otherwise remote clients cannot match the participant.
 async fn join(svc: &Service, sfu: &FakeSfu, hs: &FakeHomeserver, user: &FakeUser) -> String {
     let room = livekit_room_alias(ROOM_ID, SLOT_ID);
-    let identity = livekit_identity(&user.user_id, MEMBER_ID);
+    let identity = legacy_livekit_identity(&user.user_id, DEVICE_ID, MEMBER_ID);
     let mut request = share_request(hs, user);
-    request.as_object_mut().unwrap().remove("member_id");
+    let fields = request.as_object_mut().unwrap();
+    fields.remove("member_id");
+    fields.remove("device_id");
     request["member"] = json!({
         "id": MEMBER_ID,
         "claimed_user_id": user.user_id,
-        "claimed_device_id": "DEVICE",
+        "claimed_device_id": DEVICE_ID,
     });
     let (status, body) = post(svc, "/get_token", &request).await;
     assert_eq!(status, 200, "{body}");
@@ -221,6 +228,31 @@ async fn claim_requires_verified_room_membership_and_an_sfu_participant() {
 
     let (status, body) = post(&svc, "/babacom/share/claim", &share_request(&hs, &bob)).await;
     expect_matrix_error(status, &body, 409, "IO.BABACOM.NOT_IN_CALL");
+}
+
+#[tokio::test]
+async fn claim_targets_the_device_that_joined() {
+    let hs = FakeHomeserver::new().await;
+    let alice = hs.new_user("alice");
+    let sfu = FakeSfu::new().await;
+    let svc = start(&hs, &sfu, true).await;
+    join(&svc, &sfu, &hs, &alice).await;
+
+    let mut missing_device = share_request(&hs, &alice);
+    missing_device.as_object_mut().unwrap().remove("device_id");
+    let (status, body) = post(&svc, "/babacom/share/claim", &missing_device).await;
+    expect_matrix_error(status, &body, 400, "M_BAD_JSON");
+
+    // Another device of the same user is a different participant.
+    let mut other_device = share_request(&hs, &alice);
+    other_device["device_id"] = json!("OTHER");
+    let (status, body) = post(&svc, "/babacom/share/claim", &other_device).await;
+    expect_matrix_error(status, &body, 409, "IO.BABACOM.NOT_IN_CALL");
+
+    expect_state(
+        post(&svc, "/babacom/share/claim", &share_request(&hs, &alice)).await,
+        "held",
+    );
 }
 
 #[tokio::test]
